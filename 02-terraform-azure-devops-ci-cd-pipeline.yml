@@ -1,0 +1,126 @@
+trigger:
+- main
+
+variables:
+  # Azure Resource Manager connection created during pipeline creation
+  azureServiceConnection: 'azure-terraform-connection'
+  terraformVersion: '1.5.7'
+  workingDirectory: '$(System.DefaultWorkingDirectory)/terraform-manifests'
+  environmentName: 'dev'  # Can be parameterized for different environments
+
+stages:
+# Validate Stage
+- stage: Validate
+  displayName: Validate Terraform Configuration
+  jobs:
+  - job: TerraformValidate
+    displayName: Validate Terraform Files
+    pool:
+      vmImage: 'ubuntu-latest'
+    steps:
+    - task: TerraformInstaller@0
+      inputs:
+        terraformVersion: '$(terraformVersion)'
+    
+    - bash: |
+        cd $(workingDirectory)
+        terraform fmt -check
+        terraform init -backend=false
+        terraform validate
+      displayName: 'Terraform Validate and Format Check'
+
+# Plan Stage  
+- stage: Plan
+  displayName: Terraform Plan
+  jobs:
+  - job: TerraformPlan
+    displayName: Create Terraform Plan
+    pool:
+      vmImage: 'ubuntu-latest'
+    steps:
+    - task: TerraformInstaller@0
+      inputs:
+        terraformVersion: '$(terraformVersion)'
+    
+    - task: TerraformTaskV3@3
+      inputs:
+        provider: 'azurerm'
+        command: 'init'
+        workingDirectory: '$(workingDirectory)'
+        backendServiceArm: '$(azureServiceConnection)'
+        backendAzureRmResourceGroupName: 'tfstate-rg'
+        backendAzureRmStorageAccountName: 'tfstate$(environmentName)sa'
+        backendAzureRmContainerName: 'tfstate'
+        backendAzureRmKey: '$(environmentName).terraform.tfstate'
+    
+    - task: TerraformTaskV3@3
+      inputs:
+        provider: 'azurerm'
+        command: 'plan'
+        workingDirectory: '$(workingDirectory)'
+        environmentServiceNameAzureRM: '$(azureServiceConnection)'
+        commandOptions: '-var-file=$(workingDirectory)/$(environmentName).tfvars'
+      displayName: 'Terraform Plan for $(environmentName) Environment'
+
+# Apply Stage (Optional - typically done manually or with approval)
+- stage: Apply
+  displayName: Terraform Apply
+  condition: and(succeeded(), ne(variables['Build.Reason'], 'PullRequest'))
+  jobs:
+  - deployment: TerraformApply
+    displayName: Apply Terraform Configuration
+    pool:
+      vmImage: 'ubuntu-latest'
+    environment: '$(environmentName)'
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - task: TerraformInstaller@0
+            inputs:
+              terraformVersion: '$(terraformVersion)'
+          
+          - task: TerraformTaskV3@3
+            inputs:
+              provider: 'azurerm'
+              command: 'init'
+              workingDirectory: '$(workingDirectory)'
+              backendServiceArm: '$(azureServiceConnection)'
+              backendAzureRmResourceGroupName: 'tfstate-rg'
+              backendAzureRmStorageAccountName: 'tfstate$(environmentName)sa'
+              backendAzureRmContainerName: 'tfstate'
+              backendAzureRmKey: '$(environmentName).terraform.tfstate'
+          
+          - task: TerraformTaskV3@3
+            inputs:
+              provider: 'azurerm'
+              command: 'apply'
+              workingDirectory: '$(workingDirectory)'
+              environmentServiceNameAzureRM: '$(azureServiceConnection)'
+              commandOptions: '-var-file=$(workingDirectory)/$(environmentName).tfvars -auto-approve'
+            displayName: 'Terraform Apply for $(environmentName) Environment'
+
+# Artifact Build Stage 
+- stage: BuildArtifacts
+  displayName: Build and Publish Terraform Artifacts
+  jobs:
+  - job: BuildAndPublish
+    displayName: Build and Publish Job
+    pool:
+      vmImage: 'ubuntu-latest'
+    steps: 
+    - task: CopyFiles@2
+      inputs:
+        SourceFolder: '$(System.DefaultWorkingDirectory)/terraform-manifests'
+        Contents: |
+          **/*.tf
+          **/*.tfvars
+          .terraform.lock.hcl
+        TargetFolder: '$(Build.ArtifactStagingDirectory)'
+        OverWrite: true
+    
+    - task: PublishBuildArtifacts@1
+      inputs:
+        PathtoPublish: '$(Build.ArtifactStagingDirectory)'
+        ArtifactName: 'terraform-manifests'
+        publishLocation: 'Container'
